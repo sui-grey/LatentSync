@@ -5,6 +5,7 @@ import inspect
 import math
 import os
 import shutil
+import time
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -447,6 +448,17 @@ class LipsyncPipeline(DiffusionPipeline):
 
         check_ffmpeg_installed()
 
+        # Per-stage wall-clock, printed at the end and kept in self.last_timings
+        timings = {}
+        stage_start = [time.perf_counter()]
+
+        def mark(stage):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            now = time.perf_counter()
+            timings[stage] = timings.get(stage, 0.0) + now - stage_start[0]
+            stage_start[0] = now
+
         # 0. Define call parameters
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
@@ -476,10 +488,12 @@ class LipsyncPipeline(DiffusionPipeline):
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        mark("setup")
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
+        mark("audio")
         if ref_cache:
             video_frames = self._read_video_cached(video_path)
             cache_key = self._ref_cache_key(video_path, height, len(video_frames))
@@ -489,6 +503,7 @@ class LipsyncPipeline(DiffusionPipeline):
         else:
             video_frames = read_video(video_path, use_decord=False)
             video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        mark("reference")
 
         synced_video_frames = []
 
@@ -578,7 +593,9 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             synced_video_frames.append(decoded_latents)
 
+        mark("diffusion")
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        mark("restore")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
@@ -602,3 +619,7 @@ class LipsyncPipeline(DiffusionPipeline):
             write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps, crf=18)
             command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v copy -c:a aac -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
+        mark("encode")
+
+        self.last_timings = dict(timings, total=sum(timings.values()))
+        print("Timings: " + " | ".join(f"{stage} {seconds:.1f}s" for stage, seconds in self.last_timings.items()))
