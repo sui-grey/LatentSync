@@ -54,3 +54,4 @@ wandb/
 # reference alignment cache (see --ref_cache_dir)
 .cache/
 benchmark_out/
+server_data/
