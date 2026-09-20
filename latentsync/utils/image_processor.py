@@ -46,10 +46,17 @@ class ImageProcessor:
         else:
             self.mask_image = mask_image
 
-        if device == "cpu":
-            self.face_detector = None
-        else:
-            self.face_detector = FaceDetector(device=device)
+        # The face detector is loaded on first use, not here: loading it takes ~30s (insightface ONNX
+        # sessions on CUDA) and it is not needed at all when the alignment results come from the
+        # reference cache. On CPU there is no detector (unchanged behaviour).
+        self._device = device
+        self._face_detector = None
+
+    @property
+    def face_detector(self):
+        if self._face_detector is None and self._device != "cpu":
+            self._face_detector = FaceDetector(device=self._device)
+        return self._face_detector
 
     def affine_transform(self, image: torch.Tensor) -> np.ndarray:
         if self.face_detector is None:

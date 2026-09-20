@@ -24,18 +24,12 @@ from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
 
 
-def main(config, args):
-    if not os.path.exists(args.video_path):
-        raise RuntimeError(f"Video path '{args.video_path}' not found")
-    if not os.path.exists(args.audio_path):
-        raise RuntimeError(f"Audio path '{args.audio_path}' not found")
-
+def build_pipeline(config, args):
+    """Load all models and return (pipeline, dtype). Shared by the CLI below and tools/benchmark.py."""
     # Check if the GPU supports float16
     is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
 
-    print(f"Input video path: {args.video_path}")
-    print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
 
     scheduler = DDIMScheduler.from_pretrained("configs")
@@ -79,6 +73,20 @@ def main(config, args):
         helper.set_params(cache_interval=3, cache_branch_id=0)
         helper.enable()
 
+    return pipeline, dtype
+
+
+def main(config, args):
+    if not os.path.exists(args.video_path):
+        raise RuntimeError(f"Video path '{args.video_path}' not found")
+    if not os.path.exists(args.audio_path):
+        raise RuntimeError(f"Audio path '{args.audio_path}' not found")
+
+    print(f"Input video path: {args.video_path}")
+    print(f"Input audio path: {args.audio_path}")
+
+    pipeline, dtype = build_pipeline(config, args)
+
     if args.seed != -1:
         set_seed(args.seed)
     else:
@@ -98,6 +106,8 @@ def main(config, args):
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
+        ref_cache=not args.no_ref_cache,
+        ref_cache_dir=args.ref_cache_dir or None,
     )
 
 
@@ -113,6 +123,17 @@ if __name__ == "__main__":
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
     parser.add_argument("--enable_deepcache", action="store_true")
+    parser.add_argument(
+        "--no_ref_cache",
+        action="store_true",
+        help="Stock behaviour: redo face detection / alignment of the reference video on every run",
+    )
+    parser.add_argument(
+        "--ref_cache_dir",
+        type=str,
+        default=".cache/ref_affine",
+        help="Directory for persisted reference alignment results ('' = memory only)",
+    )
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

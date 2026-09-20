@@ -50,3 +50,7 @@ wandb/
 !/docs/*
 !/internal/*.png
 .cog/
+
+# reference alignment cache (see --ref_cache_dir)
+.cache/
+benchmark_out/

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
+import hashlib
 import inspect
 import math
 import os
@@ -278,7 +279,107 @@ class LipsyncPipeline(DiffusionPipeline):
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
+    # ------------------------------------------------------------------
+    # Reference cache
+    #
+    # Everything computed from the reference video alone (decoded frames, per-frame face
+    # detection + affine alignment) is independent of the audio, yet the stock pipeline
+    # redoes it on every call. When the same reference video is reused (an avatar, a
+    # dubbing source, a serving process), that is most of the wall-clock time:
+    # on an RTX 4090, 11.8s of audio took 116s of which only ~15s was diffusion.
+    #
+    # The affine results are memoised in memory and (optionally) on disk, keyed by the
+    # video file identity (path + mtime + size), the resolution and the frame count.
+    # Re-uploading/overwriting the video changes the key, so the cache self-invalidates.
+    # ------------------------------------------------------------------
+
+    _REF_FRAMES_CACHE_SIZE = 2  # decoded frames are large (~1GB for 15s of 720p)
+    _REF_AFFINE_CACHE_SIZE = 4
+
+    @staticmethod
+    def _ref_cache_key(video_path: str, resolution, num_frames: int) -> str:
+        st = os.stat(video_path)
+        raw = f"v1|{os.path.abspath(video_path)}|{st.st_mtime_ns}|{st.st_size}|{resolution}|{num_frames}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+    def _read_video_cached(self, video_path: str) -> np.ndarray:
+        cache = self.__dict__.setdefault("_ref_frames_cache", {})
+        st = os.stat(video_path)
+        key = (os.path.abspath(video_path), st.st_mtime_ns, st.st_size)
+        if key not in cache:
+            while len(cache) >= self._REF_FRAMES_CACHE_SIZE:
+                cache.pop(next(iter(cache)))
+            cache[key] = read_video(video_path, use_decord=False)
+        return cache[key]
+
+    def _affine_transform_video_cached(self, video_frames: np.ndarray, key: str, cache_dir: Optional[str]):
+        """affine_transform_video() over the WHOLE reference video, memoised in memory and on disk."""
+        cache = self.__dict__.setdefault("_ref_affine_cache", {})
+        if key in cache:
+            print(f"Reference cache hit (memory): {len(video_frames)} frames")
+            return cache[key]
+
+        restorer = self.image_processor.restorer
+        cache_file = os.path.join(cache_dir, f"{key}.pt") if cache_dir else None
+        result = None
+        if cache_file and os.path.exists(cache_file):
+            try:
+                data = torch.load(cache_file, map_location="cpu", weights_only=True)
+                affine = data["affine_matrices"].to(device=restorer.device, dtype=restorer.dtype)
+                result = (data["faces"], data["boxes"], [m.unsqueeze(0) for m in affine])
+                print(f"Reference cache hit (disk): {len(video_frames)} frames <- {cache_file}")
+            except Exception as e:  # corrupt / incompatible cache file: recompute
+                print(f"Reference cache file unreadable ({e}); recomputing")
+
+        if result is None:
+            # The aligner smooths the affine bias over time (p_bias). Start from a clean state so the
+            # result equals a fresh stock run, even when the ImageProcessor is reused across videos.
+            restorer.p_bias = None
+            result = self.affine_transform_video(video_frames)
+            if cache_file:
+                faces, boxes, affine_matrices = result
+                os.makedirs(cache_dir, exist_ok=True)
+                tmp_file = cache_file + ".tmp"
+                torch.save(
+                    {"faces": faces, "boxes": boxes, "affine_matrices": torch.cat(affine_matrices).cpu()},
+                    tmp_file,
+                )
+                os.replace(tmp_file, cache_file)
+
+        while len(cache) >= self._REF_AFFINE_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[key] = result
+        return result
+
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, cache_key=None, cache_dir=None):
+        if cache_key is not None:
+            # Cached path: align the whole reference once, then slice / ping-pong the cached results.
+            # Alignment is causal (frame i depends only on frames <= i), so slicing the full-video
+            # result is identical to the stock behaviour of aligning only the first N frames.
+            faces, boxes, affine_matrices = self._affine_transform_video_cached(video_frames, cache_key, cache_dir)
+            n = len(whisper_chunks)
+            if n > len(video_frames):
+                num_loops = math.ceil(n / len(video_frames))
+                loop_video_frames, loop_faces, loop_boxes, loop_affine_matrices = [], [], [], []
+                for i in range(num_loops):
+                    if i % 2 == 0:
+                        loop_video_frames.append(video_frames)
+                        loop_faces.append(faces)
+                        loop_boxes += boxes
+                        loop_affine_matrices += affine_matrices
+                    else:
+                        loop_video_frames.append(video_frames[::-1])
+                        loop_faces.append(faces.flip(0))
+                        loop_boxes += boxes[::-1]
+                        loop_affine_matrices += affine_matrices[::-1]
+                return (
+                    np.concatenate(loop_video_frames, axis=0)[:n],
+                    torch.cat(loop_faces, dim=0)[:n],
+                    loop_boxes[:n],
+                    loop_affine_matrices[:n],
+                )
+            return video_frames[:n], faces[:n], boxes[:n], affine_matrices[:n]
+
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
@@ -329,8 +430,16 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        ref_cache: bool = True,
+        ref_cache_dir: Optional[str] = ".cache/ref_affine",
         **kwargs,
     ):
+        """
+        ref_cache: reuse everything derived from the reference video alone (face detector, decoded
+            frames, per-frame affine alignment) across calls. Set False for the stock behaviour.
+        ref_cache_dir: where alignment results are persisted so that new processes (CLI runs, server
+            restarts) also start warm. None keeps the cache in memory only.
+        """
         is_train = self.unet.training
         self.unet.eval()
 
@@ -339,7 +448,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # 0. Define call parameters
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+        reusable = getattr(self, "image_processor", None)
+        if ref_cache and reusable is not None and reusable.resolution == height:
+            reusable.mask_image = mask_image  # keep the loaded face detector
+        else:
+            self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
@@ -365,9 +478,15 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
-
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        if ref_cache:
+            video_frames = self._read_video_cached(video_path)
+            cache_key = self._ref_cache_key(video_path, height, len(video_frames))
+            video_frames, faces, boxes, affine_matrices = self.loop_video(
+                whisper_chunks, video_frames, cache_key=cache_key, cache_dir=ref_cache_dir
+            )
+        else:
+            video_frames = read_video(video_path, use_decord=False)
+            video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
         synced_video_frames = []
 
