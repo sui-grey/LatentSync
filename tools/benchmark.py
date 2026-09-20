@@ -119,12 +119,14 @@ def main():
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     cached = dict(ref_cache=True, ref_cache_dir=cache_dir)
+    legacy = dict(legacy_encode=True, restore_batch_size=1)
     modes = [
-        ("stock", dict(ref_cache=False, legacy_encode=True), lambda: clear_reference_state(pipeline)),
-        ("ref cache: miss (first ever run)", dict(legacy_encode=True, **cached), reset_cold_no_disk),
-        ("ref cache: disk hit (new process)", dict(legacy_encode=True, **cached), lambda: clear_reference_state(pipeline)),
-        ("ref cache: memory hit (serving)", dict(legacy_encode=True, **cached), lambda: None),
-        ("+ single encode", dict(legacy_encode=False, **cached), lambda: None),
+        ("stock", dict(ref_cache=False, **legacy), lambda: clear_reference_state(pipeline)),
+        ("ref cache: miss (first ever run)", dict(**legacy, **cached), reset_cold_no_disk),
+        ("ref cache: disk hit (new process)", dict(**legacy, **cached), lambda: clear_reference_state(pipeline)),
+        ("ref cache: memory hit (serving)", dict(**legacy, **cached), lambda: None),
+        ("+ single encode", dict(legacy_encode=False, restore_batch_size=1, **cached), lambda: None),
+        ("+ batched restore (all on)", dict(legacy_encode=False, restore_batch_size=16, **cached), lambda: None),
     ]
     if args.only:
         keep = {0} | {int(i) for i in args.only.split(",")}  # stock is always needed as the reference
@@ -134,9 +136,9 @@ def main():
     # reference cache, so the "hit" modes are real hits even when earlier modes are skipped with --only.
     print("\n=== warm-up ===")
     clear_reference_state(pipeline)
-    run_once(pipeline, config, dtype, args, os.path.join(args.out_dir, "warmup.mp4"), legacy_encode=True, **cached)
+    run_once(pipeline, config, dtype, args, os.path.join(args.out_dir, "warmup.mp4"), **legacy, **cached)
 
-    results = []
+    results, stage_rows = [], []
     for index, (name, overrides, reset) in enumerate(modes):
         out_path = os.path.join(args.out_dir, f"mode{index}.mp4")
         times = []
@@ -145,6 +147,7 @@ def main():
             reset()
             times.append(run_once(pipeline, config, dtype, args, out_path, **overrides))
         results.append((name, times, out_path))
+        stage_rows.append((name, dict(getattr(pipeline, "last_timings", {}))))
 
     stock_path = results[0][2]
     stock_mean = float(np.mean(results[0][1]))
@@ -166,6 +169,13 @@ def main():
             f"| {name} | {mean:.1f}s | {best:.1f}s | {stock_mean / mean:.2f}x | {mean / audio_s:.1f}x | "
             f"{fmt_psnr(mean_psnr)} / {fmt_psnr(min_psnr)} | {os.path.getsize(out_path) / 1e6:.1f} MB |"
         )
+
+    stages = ["audio", "reference", "diffusion", "restore", "encode", "total"]
+    print("\nWhere the time goes (last run of each mode):\n")
+    print("| mode | " + " | ".join(stages) + " |")
+    print("|---|" + "---|" * len(stages))
+    for name, timings in stage_rows:
+        print(f"| {name} | " + " | ".join(f"{timings.get(stage, 0):.1f}s" for stage in stages) + " |")
 
 
 if __name__ == "__main__":

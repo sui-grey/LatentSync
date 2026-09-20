@@ -95,6 +95,64 @@ class AlignRestore(object):
         img_back = img_back.cpu().numpy()
         return img_back
 
+    @staticmethod
+    def _erode_square(mask: torch.Tensor, size: int) -> torch.Tensor:
+        """Erosion with a size x size all-ones kernel, on the GPU, equal to
+        cv2.erode(mask, np.ones((size, size))) including the anchor of even kernels and the border rule.
+
+        A flat erosion is a min-pool, i.e. -max_pool(-x). max_pool2d pads with -inf, which like OpenCV's
+        default border never wins the min. Unlike kornia.morphology.erosion (unfold based, O(size^2)
+        memory, which is why the per-frame code below falls back to the CPU) this needs no extra memory.
+        """
+        if size < 1:  # cv2.erode treats an empty kernel as 3x3
+            size = 3
+        pad = size // 2
+        h, w = mask.shape[-2:]
+        eroded = -torch.nn.functional.max_pool2d(-mask, kernel_size=size, stride=1, padding=pad)
+        return eroded[..., :h, :w]
+
+    def restore_imgs(self, input_imgs: np.ndarray, faces: torch.Tensor, affine_matrices: torch.Tensor):
+        """Batched restore_img(): paste `faces` (B, 3, fh, fw) back into `input_imgs` (B, H, W, 3 uint8).
+
+        Same maths as restore_img, but one host<->device round trip and one GPU sync per batch instead of
+        three per frame, and no CPU work in between. affine_matrices: (B, 2, 3).
+        """
+        b, h, w, _ = input_imgs.shape
+        inv_affine_matrices = kornia.geometry.transform.invert_affine_transform(affine_matrices)
+        faces = faces.to(device=self.device, dtype=self.dtype)
+
+        inv_faces = kornia.geometry.transform.warp_affine(
+            faces, inv_affine_matrices, (h, w), mode="bilinear", padding_mode="fill", fill_value=self.fill_value
+        )
+        inv_faces = (inv_faces / 2 + 0.5).clamp(0, 1) * 255
+
+        imgs = torch.from_numpy(input_imgs).to(device=self.device, dtype=self.dtype).permute(0, 3, 1, 2)
+        inv_masks = kornia.geometry.transform.warp_affine(
+            self.mask.expand(b, -1, -1, -1), inv_affine_matrices, (h, w), padding_mode="zeros"
+        )  # (B, 1, H, W)
+        inv_masks_erosion = kornia.morphology.erosion(
+            inv_masks,
+            torch.ones(
+                (int(2 * self.upscale_factor), int(2 * self.upscale_factor)), device=self.device, dtype=self.dtype
+            ),
+        )
+        pasted_faces = inv_masks_erosion * inv_faces
+
+        # The feathering width depends on each frame's face area; frames of one video nearly always share
+        # it, so group the batch by width (usually a single group) and process each group at once.
+        areas = inv_masks_erosion.float().sum(dim=(1, 2, 3)).tolist()  # the only GPU sync of the batch
+        w_edges = [int(area**0.5) // 20 for area in areas]
+        soft_masks = torch.empty_like(inv_masks_erosion)
+        for w_edge in sorted(set(w_edges)):
+            index = torch.tensor([i for i, e in enumerate(w_edges) if e == w_edge], device=self.device)
+            centers = self._erode_square(inv_masks_erosion[index], w_edge * 2)
+            blur_size = w_edge * 2 + 1
+            sigma = 0.3 * ((blur_size - 1) * 0.5 - 1) + 0.8
+            soft_masks[index] = kornia.filters.gaussian_blur2d(centers, (blur_size, blur_size), (sigma, sigma))
+
+        imgs_back = soft_masks * pasted_faces + (1 - soft_masks) * imgs
+        return imgs_back.permute(0, 2, 3, 1).contiguous().to(dtype=torch.uint8).cpu().numpy()
+
     def transformation_from_points(self, points1: torch.Tensor, points0: torch.Tensor, smooth=True, p_bias=None):
         if isinstance(points0, np.ndarray):
             points2 = torch.tensor(points0, device=self.device, dtype=torch.float32)

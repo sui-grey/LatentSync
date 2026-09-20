@@ -109,6 +109,7 @@ def main(config, args):
         ref_cache=not args.no_ref_cache,
         ref_cache_dir=args.ref_cache_dir or None,
         legacy_encode=args.legacy_encode,
+        restore_batch_size=args.restore_batch_size,
     )
 
 
@@ -139,6 +140,12 @@ if __name__ == "__main__":
         "--legacy_encode",
         action="store_true",
         help="Stock behaviour: encode at crf 13, then re-encode at crf 18 while muxing the audio",
+    )
+    parser.add_argument(
+        "--restore_batch_size",
+        type=int,
+        default=16,
+        help="Frames pasted back into the video per GPU batch (1 = stock per-frame loop)",
     )
     args = parser.parse_args()
 

@@ -265,8 +265,37 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = torch.stack(faces)
         return faces, boxes, affine_matrices
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
+    def restore_video(
+        self,
+        faces: torch.Tensor,
+        video_frames: np.ndarray,
+        boxes: list,
+        affine_matrices: list,
+        batch_size: int = 1,
+    ):
         video_frames = video_frames[: len(faces)]
+        if batch_size > 1 and all(list(box) == list(boxes[0]) for box in boxes[: len(faces)]):
+            # Batched path: the stock loop below does three host<->device round trips, a GPU sync and a
+            # CPU erosion per frame, which leaves the GPU idle and makes this stage depend on how fast
+            # (and how busy) the host CPU is. Here a whole batch stays on the GPU.
+            print(f"Restoring {len(faces)} faces (batch size {batch_size})...")
+            restorer = self.image_processor.restorer
+            x1, y1, x2, y2 = boxes[0]
+            size = (int(y2 - y1), int(x2 - x1))
+            out_frames = np.empty((len(faces),) + video_frames.shape[1:], dtype=np.uint8)
+            for start in tqdm.trange(0, len(faces), batch_size):
+                end = min(start + batch_size, len(faces))
+                batch_faces = torchvision.transforms.functional.resize(
+                    faces[start:end], size=size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
+                )
+                matrices = torch.cat(
+                    [m if torch.is_tensor(m) else torch.from_numpy(m).unsqueeze(0) for m in affine_matrices[start:end]]
+                ).to(device=restorer.device, dtype=restorer.dtype)
+                out_frames[start:end] = restorer.restore_imgs(
+                    np.ascontiguousarray(video_frames[start:end]), batch_faces, matrices
+                )
+            return out_frames
+
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
         for index, face in enumerate(tqdm.tqdm(faces)):
@@ -434,10 +463,13 @@ class LipsyncPipeline(DiffusionPipeline):
         ref_cache: bool = True,
         ref_cache_dir: Optional[str] = ".cache/ref_affine",
         legacy_encode: bool = False,
+        restore_batch_size: int = 16,
         **kwargs,
     ):
         """
         legacy_encode: True restores the stock two-pass encoding (crf 13, then re-encode at crf 18).
+        restore_batch_size: frames pasted back per GPU batch (~60MB of VRAM per 720p frame).
+            1 restores the stock per-frame loop.
         ref_cache: reuse everything derived from the reference video alone (face detector, decoded
             frames, per-frame affine alignment) across calls. Set False for the stock behaviour.
         ref_cache_dir: where alignment results are persisted so that new processes (CLI runs, server
@@ -594,7 +626,9 @@ class LipsyncPipeline(DiffusionPipeline):
             synced_video_frames.append(decoded_latents)
 
         mark("diffusion")
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        synced_video_frames = self.restore_video(
+            torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, batch_size=restore_batch_size
+        )
         mark("restore")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
