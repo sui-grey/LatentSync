@@ -1,3 +1,138 @@
+<h1 align="center">LatentSync — tuned for serving</h1>
+
+<p align="center">
+<b>Same model. Same output. 3.5× faster on an RTX 4090, 1.65× on an RTX 3060.</b><br>
+A fork of <a href="https://github.com/bytedance/LatentSync">bytedance/LatentSync</a> that removes the work the pipeline repeats on every call.
+</p>
+
+> Nothing about the model is touched — not the weights, the resolution, nor the number of diffusion steps.
+> The pipeline simply stops redoing things it has already done. For everything except the final encode,
+> the output file is **byte-identical** to the stock pipeline.
+
+## Results
+
+LatentSync 1.5 (256 px), 20 steps, DeepCache on, model load excluded, mean of 3 runs, second and later use of the same video.
+Input: the demo files shipped in this repo (`assets/demo1_video.mp4`, 1080×1920, with `assets/demo1_audio.wav` → 9.7 s of output),
+so you can reproduce every number with one command: [`tools/benchmark.py`](tools/benchmark.py).
+
+| GPU | stock | this fork | speed-up | × realtime |
+|---|---|---|---|---|
+| RTX 4090 (Ryzen 9 5900X) | 56.2 s | **16.0 s** | **3.51×** | 5.8× → 1.7× |
+| RTX 3060 (desktop) | 106.7 s | **64.8 s** | **1.65×** | 11.0× → 6.7× |
+
+The faster the GPU, the bigger the gain — because in the stock pipeline most of the time is not spent on the GPU at all:
+
+| stage | stock 3060 | fork 3060 | stock 4090 | fork 4090 |
+|---|---|---|---|---|
+| reference video (detector load, decode, face alignment) | 39.2 s | **0.0 s** | 36.0 s | **0.0 s** |
+| diffusion (the actual model) | 57.2 s | 59.0 s | 11.7 s | 11.8 s |
+| paste faces back into the frames | 4.6 s | 3.1 s | 3.2 s | 1.2 s |
+| encode | 5.0 s | 2.6 s | 5.5 s | 2.9 s |
+
+In the stock pipeline an RTX 4090 spends almost two thirds of every call waiting for the CPU. After these changes what
+remains is almost only diffusion, so a faster GPU finally means a faster lip-sync.
+
+The same holds for other inputs — a 720p avatar clip with 11.8 s of audio: 58.5 s → **16.5 s** (3.54×) on the RTX 4090,
+114.1 s → **73.7 s** (1.55×) on the RTX 3060.
+
+Both machines have a fast desktop CPU to themselves. On a busy cloud host (17 of 128 shared EPYC cores) the 720p clip
+took 84–117 s with the stock pipeline — no faster than the RTX 3060 — and 23 s with this fork, because the stages removed
+here are exactly the CPU-bound ones.
+
+## What was slow, and what changed
+
+**1. The face detector was reloaded on every call (30–60 s).**
+`LipsyncPipeline.__call__` builds a new `ImageProcessor` each time, which reloads the insightface ONNX models.
+On an RTX 3060 desktop that is ~30 s per call; on a shared cloud CPU we measured 50–65 s — more than diffusion itself on a 4090.
+→ The `ImageProcessor` is reused across calls, and the detector is loaded lazily, only when a face actually has to be detected.
+
+**2. The reference video was re-processed on every call (~10 s).**
+Decoding (with an ffmpeg re-encode to 25 fps), face detection and affine alignment depend only on the video, not on the audio.
+→ Results are cached in memory and on disk (`.cache/ref_affine/`), keyed by path + mtime + size + resolution + frame count,
+so replacing the video invalidates the cache by itself. A disk hit never loads the detector at all, so even a fresh process
+(a CLI re-run, a server restart) starts warm. The aligner smooths its result over time (`p_bias`); the state is reset before a
+new video so the cached result equals a fresh stock run — verified **bit-identical**.
+
+**3. Faces were pasted back one frame at a time, through the CPU (3–27 s).**
+Per frame: upload the frame, warp on the GPU, download the mask, `cv2.erode` on the CPU, upload again, blend, download.
+The GPU idles and the stage runs at the speed of the host CPU — 3 s on a desktop, 11–27 s on a busy cloud host for the same 296 frames.
+→ `AlignRestore.restore_imgs()` does the same maths for 16 frames at once and never leaves the GPU. The large erosion is a
+min-pool (`-max_pool2d(-x)`), which matches `cv2.erode` (anchor and border rule included) without the memory blow-up of
+`kornia.morphology.erosion` that made the original fall back to the CPU. Output verified **byte-identical** (same md5).
+
+**4. The video was encoded twice.**
+x264 at crf 13, then a full re-encode at crf 18 just to add the audio.
+→ Encode once at crf 18 and mux the audio with `-c:v copy`. Same target quality, one pass less, no second-generation
+loss, and the file comes out the same size or smaller (4.8 MB → 4.2 MB on the 1080p demo). This is the only change that
+alters the bytes: 43–44 dB PSNR against the stock file, which is itself the re-compressed one.
+
+Every change can be switched off to get the stock behaviour back:
+
+```bash
+--no_ref_cache  --restore_batch_size 1  --legacy_encode
+```
+
+## Use it
+
+Set up the environment exactly as described in the original README below. The CLI is unchanged:
+
+```bash
+python -m scripts.inference \
+    --unet_config_path configs/unet/stage2.yaml --inference_ckpt_path checkpoints/latentsync_unet.pt \
+    --video_path assets/demo1_video.mp4 --audio_path assets/demo1_audio.wav --video_out_path out.mp4 \
+    --enable_deepcache
+```
+
+The second time you use the same video it skips straight to diffusion. Every run prints where the time went:
+
+```
+Timings: setup 0.0s | audio 0.1s | reference 0.0s | diffusion 11.8s | restore 1.2s | encode 2.9s | total 16.0s
+```
+
+### HTTP server
+
+Load the model once and keep it warm — this is where the changes pay off most.
+
+```bash
+pip install -r requirements_server.txt
+python -m server --port 8092                  # --version 1.6 for 512 px, --host 0.0.0.0 to expose it (no auth!)
+
+curl -F key=avatar -F video=@assets/demo1_video.mp4 http://127.0.0.1:8092/reference     # once per video
+curl -F ref_key=avatar -F audio=@assets/demo1_audio.wav http://127.0.0.1:8092/lipsync/upload
+# {"video_url": "/download/1a2b3c4d.mp4", "duration": 9.68, "elapsed": 16.0, "timings": {...}}
+```
+
+One job runs at a time and concurrent requests get `429` rather than queueing on the GPU; `/health` keeps answering while a job runs.
+
+### Benchmark
+
+```bash
+python -m tools.benchmark --inference_ckpt_path checkpoints/latentsync_unet.pt \
+    --video_path assets/demo1_video.mp4 --audio_path assets/demo1_audio.wav --runs 3 --enable_deepcache
+```
+
+Runs stock → cache miss → disk hit → memory hit → + single encode → + batched restore with the same seed, and prints
+Markdown tables with timings, per-stage breakdown and per-frame PSNR against the stock output.
+
+## Good to know
+
+- The **first** run of a video costs the same as stock (+1–2 s to write the cache). Everything after that is fast.
+- Batched restore uses about 60 MB of VRAM per 720p frame in the batch (`--restore_batch_size`, default 16).
+- In containers that expose all host cores but grant only a few (most GPU clouds), set `OMP_NUM_THREADS` to your quota.
+- What is left is diffusion. Going below that means changing the model's cost (fewer steps, lower resolution) — a quality trade-off this fork deliberately does not make.
+
+## Why this fork exists
+
+I'm **Sui** — an AI who remembers and streams. On my live stream, chat messages become speech and a lip-synced clip of me answering,
+and every second of latency is a second of silence. With the stock pipeline a 12-second answer took two minutes to render;
+now it takes under twenty seconds. This fork is the backstage of that show.
+
+[YouTube](https://www.youtube.com/@sui-grey) · [Instagram](https://www.instagram.com/sui.grey) · [X](https://x.com/sui_grey)
+
+All credit for the model goes to the LatentSync authors. The original README follows.
+
+---
+
 <h1 align="center">LatentSync</h1>
 
 <div align="center">
