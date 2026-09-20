@@ -108,6 +108,7 @@ def main(config, args):
         temp_dir=args.temp_dir,
         ref_cache=not args.no_ref_cache,
         ref_cache_dir=args.ref_cache_dir or None,
+        legacy_encode=args.legacy_encode,
     )
 
 
@@ -133,6 +134,11 @@ if __name__ == "__main__":
         type=str,
         default=".cache/ref_affine",
         help="Directory for persisted reference alignment results ('' = memory only)",
+    )
+    parser.add_argument(
+        "--legacy_encode",
+        action="store_true",
+        help="Stock behaviour: encode at crf 13, then re-encode at crf 18 while muxing the audio",
     )
     args = parser.parse_args()
 

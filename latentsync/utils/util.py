@@ -112,13 +112,13 @@ def read_audio(audio_path: str, audio_sample_rate: int = 16000):
     return audio_samples
 
 
-def write_video(video_output_path: str, video_frames: np.ndarray, fps: int):
+def write_video(video_output_path: str, video_frames: np.ndarray, fps: int, crf: int = 13):
     with imageio.get_writer(
         video_output_path,
         fps=fps,
         codec="libx264",
         macro_block_size=None,
-        ffmpeg_params=["-crf", "13"],
+        ffmpeg_params=["-crf", str(crf)],
         ffmpeg_log_level="error",
     ) as writer:
         for video_frame in video_frames:

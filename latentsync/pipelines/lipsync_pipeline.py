@@ -432,9 +432,11 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         ref_cache: bool = True,
         ref_cache_dir: Optional[str] = ".cache/ref_affine",
+        legacy_encode: bool = False,
         **kwargs,
     ):
         """
+        legacy_encode: True restores the stock two-pass encoding (crf 13, then re-encode at crf 18).
         ref_cache: reuse everything derived from the reference video alone (face detector, decoded
             frames, per-frame affine alignment) across calls. Set False for the stock behaviour.
         ref_cache_dir: where alignment results are persisted so that new processes (CLI runs, server
@@ -588,9 +590,15 @@ class LipsyncPipeline(DiffusionPipeline):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
-
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        if legacy_encode:
+            # Stock: encode at crf 13, then re-encode the whole video at crf 18 while muxing the audio.
+            write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
+            command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        else:
+            # Encode once at the final quality (crf 18) and only mux the audio: same target quality and
+            # file size as stock, one x264 pass instead of two, and no second-generation encoding loss.
+            write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps, crf=18)
+            command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v copy -c:a aac -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)

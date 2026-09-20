@@ -104,6 +104,7 @@ def main():
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
     parser.add_argument("--enable_deepcache", action="store_true")
+    parser.add_argument("--only", type=str, default="", help="comma separated mode indices to run besides stock, e.g. 3,4")
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)
@@ -117,21 +118,23 @@ def main():
         clear_reference_state(pipeline)
         shutil.rmtree(cache_dir, ignore_errors=True)
 
+    cached = dict(ref_cache=True, ref_cache_dir=cache_dir)
     modes = [
-        ("stock (no cache)", dict(ref_cache=False), lambda: clear_reference_state(pipeline)),
-        ("ref cache: miss (first ever run)", dict(ref_cache=True, ref_cache_dir=cache_dir), reset_cold_no_disk),
-        (
-            "ref cache: disk hit (new process)",
-            dict(ref_cache=True, ref_cache_dir=cache_dir),
-            lambda: clear_reference_state(pipeline),
-        ),
-        ("ref cache: memory hit (serving)", dict(ref_cache=True, ref_cache_dir=cache_dir), lambda: None),
+        ("stock", dict(ref_cache=False, legacy_encode=True), lambda: clear_reference_state(pipeline)),
+        ("ref cache: miss (first ever run)", dict(legacy_encode=True, **cached), reset_cold_no_disk),
+        ("ref cache: disk hit (new process)", dict(legacy_encode=True, **cached), lambda: clear_reference_state(pipeline)),
+        ("ref cache: memory hit (serving)", dict(legacy_encode=True, **cached), lambda: None),
+        ("+ single encode", dict(legacy_encode=False, **cached), lambda: None),
     ]
+    if args.only:
+        keep = {0} | {int(i) for i in args.only.split(",")}  # stock is always needed as the reference
+        modes = [m for i, m in enumerate(modes) if i in keep]
 
-    # Warm-up: CUDA kernels / cudnn autotune, so the first timed mode is not penalised.
+    # Warm-up: CUDA kernels / cudnn autotune, so the first timed mode is not penalised. It also fills the
+    # reference cache, so the "hit" modes are real hits even when earlier modes are skipped with --only.
     print("\n=== warm-up ===")
     clear_reference_state(pipeline)
-    run_once(pipeline, config, dtype, args, os.path.join(args.out_dir, "warmup.mp4"), ref_cache=False)
+    run_once(pipeline, config, dtype, args, os.path.join(args.out_dir, "warmup.mp4"), legacy_encode=True, **cached)
 
     results = []
     for index, (name, overrides, reset) in enumerate(modes):
@@ -154,14 +157,14 @@ def main():
         f"deepcache {'on' if args.enable_deepcache else 'off'}"
     )
     print(f"- output: {audio_s:.1f}s of video, {args.runs} runs per mode, model load excluded\n")
-    print("| mode | mean | best | vs stock | x realtime | PSNR vs stock (mean / min) |")
-    print("|---|---|---|---|---|---|")
+    print("| mode | mean | best | vs stock | x realtime | PSNR vs stock (mean / min) | size |")
+    print("|---|---|---|---|---|---|---|")
     for name, times, out_path in results:
         mean, best = float(np.mean(times)), float(np.min(times))
         mean_psnr, min_psnr, _ = psnr_against(stock_path, out_path)
         print(
             f"| {name} | {mean:.1f}s | {best:.1f}s | {stock_mean / mean:.2f}x | {mean / audio_s:.1f}x | "
-            f"{fmt_psnr(mean_psnr)} / {fmt_psnr(min_psnr)} |"
+            f"{fmt_psnr(mean_psnr)} / {fmt_psnr(min_psnr)} | {os.path.getsize(out_path) / 1e6:.1f} MB |"
         )
 
 
