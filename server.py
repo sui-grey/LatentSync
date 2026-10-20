@@ -13,6 +13,7 @@
 #   # 2) lip-sync any number of audio clips against it
 #   curl -F ref_key=avatar -F audio=@assets/demo1_audio.wav http://127.0.0.1:8092/lipsync/upload
 #   #    -> {"video_url": "/download/1a2b3c4d.mp4", "duration": 11.84, "elapsed": 23.4, "timings": {...}}
+#   #    add -F crf=14 -F ref_crf=10 for a higher-quality (bigger) file; both default to the stock 18
 #   curl -O http://127.0.0.1:8092/download/1a2b3c4d.mp4
 #
 # One job runs at a time (it owns the GPU); a second request gets HTTP 429 so the caller can retry or
@@ -55,6 +56,8 @@ class LipsyncRequest(BaseModel):
     inference_steps: int = 20
     guidance_scale: float = 1.0
     seed: Optional[int] = None
+    crf: int = 18  # x264 crf of the result (lower = better quality, bigger file); 18 = stock
+    ref_crf: int = 18  # crf of the 25 fps intermediate the reference is decoded from; 18 = stock
 
 
 class LipsyncResponse(BaseModel):
@@ -104,7 +107,9 @@ def prune_outputs():
             pass
 
 
-def run_job(audio_path: str, ref_key: str, inference_steps: int, guidance_scale: float, seed: Optional[int]):
+def run_job(audio_path: str, ref_key: str, inference_steps: int, guidance_scale: float, seed: Optional[int], crf: int = 18, ref_crf: int = 18):
+    if not (0 <= crf <= 51 and 0 <= ref_crf <= 51):
+        raise HTTPException(status_code=422, detail="crf and ref_crf must be within 0..51")
     ref_path = reference_path(ref_key)
     if not os.path.exists(ref_path):
         raise HTTPException(status_code=404, detail=f"Reference '{ref_key}' not found; POST /reference first")
@@ -138,6 +143,8 @@ def run_job(audio_path: str, ref_key: str, inference_steps: int, guidance_scale:
             ref_cache_dir=data_path("ref_cache"),
             legacy_encode=settings.legacy_encode,
             restore_batch_size=settings.restore_batch_size,
+            crf=crf,
+            ref_crf=ref_crf,
         )
         elapsed = round(time.perf_counter() - start, 2)
         timings = {k: round(v, 2) for k, v in getattr(pipeline, "last_timings", {}).items()}
@@ -208,7 +215,7 @@ def list_references():
 @app.post("/lipsync", response_model=LipsyncResponse)
 def lipsync(req: LipsyncRequest):
     """Audio already on this machine (path). Use /lipsync/upload from another machine."""
-    return run_job(req.audio_path, req.ref_key, req.inference_steps, req.guidance_scale, req.seed)
+    return run_job(req.audio_path, req.ref_key, req.inference_steps, req.guidance_scale, req.seed, req.crf, req.ref_crf)
 
 
 @app.post("/lipsync/upload", response_model=LipsyncResponse)
@@ -218,6 +225,8 @@ def lipsync_upload(
     inference_steps: int = Form(20),
     guidance_scale: float = Form(1.0),
     seed: Optional[int] = Form(None),
+    crf: int = Form(18),
+    ref_crf: int = Form(18),
 ):
     if gpu_lock.locked():  # refuse before reading the upload
         raise HTTPException(status_code=429, detail="Server busy, try again later")
@@ -225,7 +234,7 @@ def lipsync_upload(
     with open(audio_path, "wb") as f:
         shutil.copyfileobj(audio.file, f)
     try:
-        return run_job(audio_path, ref_key, inference_steps, guidance_scale, seed)
+        return run_job(audio_path, ref_key, inference_steps, guidance_scale, seed, crf, ref_crf)
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)

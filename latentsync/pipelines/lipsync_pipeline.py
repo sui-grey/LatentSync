@@ -327,19 +327,21 @@ class LipsyncPipeline(DiffusionPipeline):
     _REF_AFFINE_CACHE_SIZE = 4
 
     @staticmethod
-    def _ref_cache_key(video_path: str, resolution, num_frames: int) -> str:
+    def _ref_cache_key(video_path: str, resolution, num_frames: int, ref_crf: int = 18) -> str:
         st = os.stat(video_path)
         raw = f"v1|{os.path.abspath(video_path)}|{st.st_mtime_ns}|{st.st_size}|{resolution}|{num_frames}"
+        if ref_crf != 18:  # the stock intermediate keeps the stock key, so existing caches stay valid
+            raw += f"|ref_crf={ref_crf}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
-    def _read_video_cached(self, video_path: str) -> np.ndarray:
+    def _read_video_cached(self, video_path: str, ref_crf: int = 18) -> np.ndarray:
         cache = self.__dict__.setdefault("_ref_frames_cache", {})
         st = os.stat(video_path)
-        key = (os.path.abspath(video_path), st.st_mtime_ns, st.st_size)
+        key = (os.path.abspath(video_path), st.st_mtime_ns, st.st_size, ref_crf)
         if key not in cache:
             while len(cache) >= self._REF_FRAMES_CACHE_SIZE:
                 cache.pop(next(iter(cache)))
-            cache[key] = read_video(video_path, use_decord=False)
+            cache[key] = read_video(video_path, use_decord=False, crf=ref_crf)
         return cache[key]
 
     def _affine_transform_video_cached(self, video_frames: np.ndarray, key: str, cache_dir: Optional[str]):
@@ -464,10 +466,15 @@ class LipsyncPipeline(DiffusionPipeline):
         ref_cache_dir: Optional[str] = ".cache/ref_affine",
         legacy_encode: bool = False,
         restore_batch_size: int = 16,
+        crf: int = 18,
+        ref_crf: int = 18,
         **kwargs,
     ):
         """
         legacy_encode: True restores the stock two-pass encoding (crf 13, then re-encode at crf 18).
+        crf: x264 crf of the output file (stock 18; lower = better quality, bigger file).
+        ref_crf: x264 crf of the 25 fps intermediate the reference video is decoded from (stock 18).
+            Everything outside the mouth region is copied from those frames, so it bounds the output quality.
         restore_batch_size: frames pasted back per GPU batch (~60MB of VRAM per 720p frame).
             1 restores the stock per-frame loop.
         ref_cache: reuse everything derived from the reference video alone (face detector, decoded
@@ -527,13 +534,13 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_samples = read_audio(audio_path)
         mark("audio")
         if ref_cache:
-            video_frames = self._read_video_cached(video_path)
-            cache_key = self._ref_cache_key(video_path, height, len(video_frames))
+            video_frames = self._read_video_cached(video_path, ref_crf)
+            cache_key = self._ref_cache_key(video_path, height, len(video_frames), ref_crf)
             video_frames, faces, boxes, affine_matrices = self.loop_video(
                 whisper_chunks, video_frames, cache_key=cache_key, cache_dir=ref_cache_dir
             )
         else:
-            video_frames = read_video(video_path, use_decord=False)
+            video_frames = read_video(video_path, use_decord=False, crf=ref_crf)
             video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
         mark("reference")
 
@@ -648,9 +655,9 @@ class LipsyncPipeline(DiffusionPipeline):
             write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
             command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         else:
-            # Encode once at the final quality (crf 18) and only mux the audio: same target quality and
-            # file size as stock, one x264 pass instead of two, and no second-generation encoding loss.
-            write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps, crf=18)
+            # Encode once at the final quality (crf 18 by default) and only mux the audio: same target quality
+            # and file size as stock, one x264 pass instead of two, and no second-generation encoding loss.
+            write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps, crf=crf)
             command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v copy -c:a aac -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
         mark("encode")

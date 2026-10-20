@@ -100,6 +100,7 @@ python -m server --port 8092                  # --version 1.6 for 512 px, --host
 curl -F key=avatar -F video=@assets/demo1_video.mp4 http://127.0.0.1:8092/reference     # once per video
 curl -F ref_key=avatar -F audio=@assets/demo1_audio.wav http://127.0.0.1:8092/lipsync/upload
 # {"video_url": "/download/1a2b3c4d.mp4", "duration": 9.68, "elapsed": 16.0, "timings": {...}}
+# add -F crf=14 -F ref_crf=10 for a higher-quality (bigger) file; both default to the stock 18
 ```
 
 One job runs at a time and concurrent requests get `429` rather than queueing on the GPU; `/health` keeps answering while a job runs.
@@ -118,6 +119,10 @@ Markdown tables with timings, per-stage breakdown and per-frame PSNR against the
 
 - The **first** run of a video costs the same as stock (+1–2 s to write the cache). Everything after that is fast.
 - Batched restore uses about 60 MB of VRAM per 720p frame in the batch (`--restore_batch_size`, default 16).
+- Output quality is x264 crf 18 as in stock. Per request you can pass `crf` (the output file) and `ref_crf`
+  (the 25 fps intermediate the reference is decoded from — everything outside the mouth is copied from it),
+  e.g. `crf=14`, `ref_crf=10` for a file that is kept rather than streamed. A non-stock `ref_crf` gets its own
+  reference cache entry, so stock caches stay valid.
 - In containers that expose all host cores but grant only a few (most GPU clouds), set `OMP_NUM_THREADS` to your quota.
 - What is left is diffusion. Going below that means changing the model's cost (fewer steps, lower resolution) — a quality trade-off this fork deliberately does not make.
 
