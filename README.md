@@ -105,6 +105,10 @@ curl -F ref_key=avatar -F audio=@assets/demo1_audio.wav http://127.0.0.1:8092/li
 
 One job runs at a time and concurrent requests get `429` rather than queueing on the GPU; `/health` keeps answering while a job runs.
 
+On a shared desktop, `--idle_exit_min 10` (or `LIPSYNC_IDLE_EXIT_MIN=10`) gives the VRAM back: after 10 minutes without a
+request — `/health` does not count — the server shuts down with exit code 0, so a "restart on failure" supervisor leaves it
+down until a caller starts it again. The default 0 never exits.
+
 ### Benchmark
 
 ```bash

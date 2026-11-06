@@ -18,8 +18,14 @@
 #
 # One job runs at a time (it owns the GPU); a second request gets HTTP 429 so the caller can retry or
 # route elsewhere. There is no authentication: the default bind address is 127.0.0.1 on purpose.
+#
+# --idle_exit_min N (env LIPSYNC_IDLE_EXIT_MIN) frees the GPU on a shared desktop: after N minutes without a
+# request (/health does not count) the server shuts down cleanly with exit code 0, so a "restart on failure"
+# supervisor leaves it down until whoever needs it starts it again. 0 (the default) never exits — keep it
+# that way wherever nothing would start the server again.
 
 import argparse
+import asyncio
 import os
 import re
 import shutil
@@ -46,8 +52,9 @@ VERSIONS = {
 }
 
 settings = Namespace()  # filled by main()
-state = {}  # pipeline, config, dtype
+state = {}  # pipeline, config, dtype, last_used, server
 gpu_lock = threading.Lock()  # one job at a time
+IDLE_CHECK_SEC = 60
 
 
 class LipsyncRequest(BaseModel):
@@ -105,6 +112,37 @@ def prune_outputs():
             os.remove(path)
         except OSError:
             pass
+
+
+def should_idle_exit(idle_exit_min: float, last_used: float, now: float, busy: bool) -> bool:
+    """True once the server has gone unused for idle_exit_min minutes. 0 or less never exits, a running job never exits."""
+    if idle_exit_min <= 0 or busy:
+        return False
+    return now - last_used >= idle_exit_min * 60
+
+
+def touch():
+    state["last_used"] = time.monotonic()
+
+
+async def idle_watch():
+    """Every IDLE_CHECK_SEC: if idle long enough, take the GPU lock (no new job can start) and ask uvicorn to stop."""
+    while True:
+        await asyncio.sleep(IDLE_CHECK_SEC)
+        if not should_idle_exit(settings.idle_exit_min, state["last_used"], time.monotonic(), gpu_lock.locked()):
+            continue
+        if not gpu_lock.acquire(blocking=False):
+            continue
+        if should_idle_exit(settings.idle_exit_min, state["last_used"], time.monotonic(), busy=False):  # a request may have come in meanwhile
+            server = state.get("server")
+            if server is None:
+                print("idle exit needs `python -m server` (no uvicorn.Server to stop); staying up")
+                gpu_lock.release()
+                return
+            print(f"No request for {settings.idle_exit_min:g} min — shutting down to free the GPU")
+            server.should_exit = True
+            return  # keep holding the lock: requests during shutdown get 429, not a half-finished job
+        gpu_lock.release()
 
 
 def run_job(audio_path: str, ref_key: str, inference_steps: int, guidance_scale: float, seed: Optional[int], crf: int = 18, ref_crf: int = 18):
@@ -173,11 +211,29 @@ async def lifespan(app: FastAPI):
     state["pipeline"], state["dtype"] = build_pipeline(config, settings)
     state["config"] = config
     print(f"LatentSync loaded in {time.perf_counter() - start:.1f}s — ready on http://{settings.host}:{settings.port}")
+    touch()  # idle time counts from ready
+    watcher = asyncio.create_task(idle_watch()) if settings.idle_exit_min > 0 else None
+    if watcher:
+        print(f"Idle exit after {settings.idle_exit_min:g} min without a request")
     yield
+    if watcher:
+        watcher.cancel()
     state.clear()
 
 
 app = FastAPI(title="LatentSync server", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def mark_used(request, call_next):
+    """Every request except /health counts as use — on arrival and again when it finishes (a job may run for minutes)."""
+    if request.url.path == "/health":
+        return await call_next(request)
+    touch()
+    try:
+        return await call_next(request)
+    finally:
+        touch()
 
 
 # Plain (non-async) handlers: FastAPI runs them in a worker thread, so /health keeps answering
@@ -194,6 +250,8 @@ def health():
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "jobs_done": state.get("jobs_done", 0),
         "last_timings": state.get("last_timings"),
+        "idle_sec": round(time.monotonic() - state["last_used"]) if "last_used" in state else None,
+        "idle_exit_min": settings.idle_exit_min,
     }
 
 
@@ -268,6 +326,12 @@ def main():
     parser.add_argument("--no_ref_cache", action="store_true", help="stock behaviour, for comparison")
     parser.add_argument("--legacy_encode", action="store_true", help="stock behaviour, for comparison")
     parser.add_argument("--restore_batch_size", type=int, default=16, help="1 = stock per-frame loop")
+    parser.add_argument(
+        "--idle_exit_min",
+        type=float,
+        default=float(os.environ.get("LIPSYNC_IDLE_EXIT_MIN") or 0),
+        help="exit (code 0) after N minutes without a request, /health excluded; 0 = never (env LIPSYNC_IDLE_EXIT_MIN)",
+    )
     parser.parse_args(namespace=settings)
 
     default_config, default_ckpt = VERSIONS[settings.version]
@@ -278,7 +342,11 @@ def main():
 
     os.chdir(REPO_ROOT)  # configs/, checkpoints/ and the mask image are addressed relative to the repo root
     print(f"LatentSync server v{settings.version} | data: {settings.data_dir}")
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    server = uvicorn.Server(uvicorn.Config(app, host=settings.host, port=settings.port))
+    state["server"] = server  # idle_watch stops it through should_exit, so the process ends with code 0
+    server.run()
+    if not server.started:
+        raise SystemExit(3)  # same as uvicorn.run when startup fails
 
 
 if __name__ == "__main__":
